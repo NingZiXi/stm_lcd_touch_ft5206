@@ -1,0 +1,7 @@
+cmake_minimum_required(VERSION 3.16)
+project(touch_test C)
+enable_testing()
+add_subdirectory(.. component)
+add_executable(test_touch test_touch.c)
+target_link_libraries(test_touch PRIVATE stm_lcd_touch_ft5206)
+add_test(NAME test_touch COMMAND test_touch)
