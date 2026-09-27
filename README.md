@@ -2,6 +2,8 @@
 
 FT5206 I²C 触摸芯片驱动，独立于面板和 LVGL。板级代码负责配置 I²C、复位 GPIO 和实际器件地址；完整 HAL 与 LVGL 接入示例见[显示与触摸接入指南](https://github.com/NingZiXi/stm32-hal-lib/blob/main/docs/display-components.md)。
 
+完整中文示例：[`examples/stm32_hal/README.md`](examples/stm32_hal/README.md)（含 HAL I²C 适配与轮询代码）。
+
 ```c
 stm_lcd_touch_ft5206_t touch = {0};
 stm_lcd_touch_ft5206_config_t cfg = {
