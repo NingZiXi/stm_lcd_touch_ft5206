@@ -1,44 +1,29 @@
-# FT5206：STM32 HAL I²C 接入示例
+# lcd_touch_ft5206：STM32 HAL 接入示例
 
-`example.c` / `example.h` 提供 CubeMX 工程可移植的 I²C 寄存器读取、可选复位和轮询触点代码；不是完整 CubeMX 工程，未包含 ST HAL/CMSIS。**尚未完成触摸实板测试**。其他 STM32 系列请替换 HAL 头文件。
+本目录提供可复制到已有 HAL 应用的 `example.c` / `example.h`，不是完整 CubeMX 工程。先初始化板级时钟、GPIO 和总线，再传入实际 HAL 句柄/引脚。代码使用 STM32H7 HAL，其他系列自行替换头文件；示例不会自动编入组件库。
 
-先核对实际器件是否为 FT5206、7 位地址、供电和引脚。CubeMX 初始化对应 I²C 和可选复位 GPIO，将本组件与 `example.c` 加入 CM7 应用目标。在板级应用入口调用：
+当前示例对应未发布的新 API；软件验证通过后仍需按实物回归。FT5206 仅有主机验证，尚未实板验证。
 
-```c
-#include "example.h"
-#include "i2c.h"
-#include "gpio.h"
+## 接入步骤
 
-static stm_lcd_touch_ft5206_t touch;
-static stm_lcd_touch_ft5206_example_board_t touch_board;
-
-void app_main(void)
-{
-    touch_board = (stm_lcd_touch_ft5206_example_board_t){
-        .i2c = &hi2c_touch, /* 换成实际 I²C 句柄 */
-        .address_7bit = 0x38, /* 须用实物确认；HAL 内部使用左移后的地址 */
-        .rst_port = TOUCH_RST_GPIO_Port, .rst_pin = TOUCH_RST_Pin,
-        .width = PANEL_WIDTH, .height = PANEL_HEIGHT,
-        .swap_xy = 0, .mirror_x = 0, .mirror_y = 0,
-    };
-    int rc = stm_lcd_touch_ft5206_example_start(&touch, &touch_board);
-    for (;;) {
-        stm_lcd_touch_ft5206_point_t points[STM_LCD_TOUCH_FT5206_MAX_POINTS];
-        size_t count = 0;
-        if (rc == 0) rc = stm_lcd_touch_ft5206_example_poll(&touch, points, 5, &count);
-        if (rc != 0) { /* 记录错误码，稍后重试；不可把旧数据当新触摸。 */ rc = 0; }
-        /* 根据 count 和 points[0..count-1] 处理触摸；没有触摸时 count == 0。 */
-        HAL_Delay(20);
-    }
-}
-```
-
-无复位脚时设置 `rst_port = NULL`；根据实际屏幕方向调整 `swap_xy` / `mirror_x` / `mirror_y`。轮询示例使用阻塞 HAL API，应在任务/主循环而非中断中运行；共享 I²C 时须用项目锁保护事务。`touch_board` 和 `touch` 需长期有效。读寄存器失败为 `-2`，点数超限为 `-3`，参数或状态错误为 `-1`。
-
-在 CM7 的 `CMakeLists.txt` 把复制到 `App/` 的示例源码加入应用目标（具体目录名按工程调整）：
+1. 将组件和 stm_common 加入 CMake；LVGL port 先提供 LVGL 9 target。
+2. 将本目录两个源码文件复制到应用，替换 HAL 头文件和实际板级参数。
+3. 以 NULL 初始化句柄，按 example.h 的 start 接口创建；板级结构体必须持久有效。
+4. 循环绘图/读取触点或调用 LVGL handler，检查每一步 `err != STM_OK`。
+5. 停止所有访问后调用 `lcd_touch_ft5206_delete(&handle)`。
 
 ```cmake
-target_sources(${CMAKE_PROJECT_NAME} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/App/example.c)
+target_sources(your_firmware PRIVATE App/example.c)
+target_include_directories(your_firmware PRIVATE App)
+target_link_libraries(your_firmware PRIVATE stm_lcd_touch_ft5206)
 ```
 
-中文主页：[README.md](../../README.md)；[完整接入指南](https://github.com/NingZiXi/stm32-hal-lib/blob/main/docs/display-components.md)。
+HAL_TIMEOUT 映射为 STM_ERR_TIMEOUT，HAL_ERROR/HAL_BUSY 映射为 STM_ERR_IO，start 失败保留首个错误并回收本次创建的对象，重复 start 不覆盖已有句柄。传输同步完成后才能复用缓冲；阻塞 API 不从中断调用。
+
+## I²C 板级填写
+
+填 `lcd_touch_ft5206_example_board_t` 的 i2c、address_7bit、可选 rst_port/rst_pin、逻辑宽高及方向。FT5206 常用 0x38、8 位寄存器，地址按实物核对。HAL 接收 7 位地址左移一位。可在既有上电流程已完成复位时将 rst_port 设为空，避免重复复位。
+
+start 接收 `&handle, &board`，poll 接收 `handle, points, capacity, &count`。poll 失败 count 为零；原样返回错误，不自动重试。零点/未就绪语义以芯片 README 为准。
+
+完整 API、错误和资源契约见[中文主页](../../README.md)。

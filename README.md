@@ -1,28 +1,81 @@
-# stm_lcd_touch_ft5206
+# stm_lcd_touch_ft5206：FT5206 I²C 触摸驱动
 
-FT5206 I²C 触摸芯片驱动，独立于面板和 LVGL。板级代码负责配置 I²C、复位 GPIO 和实际器件地址；完整 HAL 与 LVGL 接入示例见[显示与触摸接入指南](https://github.com/NingZiXi/stm32-hal-lib/blob/main/docs/display-components.md)。
+提供寄存器解码、最多 5 点缓存与 swap_xy/mirror_x/mirror_y 坐标变换，不管理 I²C 外设。
 
-完整中文示例：[`examples/stm32_hal/README.md`](examples/stm32_hal/README.md)（含 HAL I²C 适配与轮询代码）。
+## 最小调用
 
 ```c
-stm_lcd_touch_ft5206_t touch = {0};
-stm_lcd_touch_ft5206_config_t cfg = {
-    .read_reg = board_read_reg, .io = &hi2c_touch,
-    .x_max = BOARD_LCD_WIDTH, .y_max = BOARD_LCD_HEIGHT,
-    .swap_xy = 0, .mirror_x = 0, .mirror_y = 0,
+lcd_touch_ft5206_handle_t touch = NULL;
+lcd_touch_ft5206_config_t cfg = {
+    .read_reg=board_read_reg,
+    .io=&board_io, .x_max=BOARD_LCD_WIDTH, .y_max=BOARD_LCD_HEIGHT,
+    .swap_xy=0, .mirror_x=0, .mirror_y=0,
 };
-int rc = stm_lcd_touch_ft5206_new_i2c(&touch, &cfg);
-if (rc == 0) rc = stm_lcd_touch_ft5206_read_data(&touch);
-if (rc == 0) {
-    stm_lcd_touch_ft5206_point_t point;
-    size_t count = 0;
-    rc = stm_lcd_touch_ft5206_get_data(&touch, &point, 1, &count);
-}
+stm_err_t err = lcd_touch_ft5206_create(&cfg, &touch);
+lcd_touch_ft5206_point_t point;
+size_t count = 0;
+if (err == STM_OK) err = lcd_touch_ft5206_read_data(touch);
+if (err == STM_OK) err = lcd_touch_ft5206_get_data(touch, &point, 1, &count);
+/* 退出时 lcd_touch_ft5206_delete(&touch)。有 reset 回调时须同时提供 delay_ms。 */
 ```
 
-`read_reg(io, reg, data, len)` 应从指定寄存器连续读取 `len` 字节，0 表示成功。常见 7 位地址 `0x38` 给 STM32 HAL `HAL_I2C_Mem_Read` 使用时传入 `0x38 << 1`，以实际器件为准。只有接好复位脚并提供 `reset` 和 `delay_ms` 回调时才调用 `stm_lcd_touch_ft5206_reset`。`read_data` 从寄存器 `0x02` 读取点数，从 `0x03` 起读取最多五个触点；每次重新读取前清空缓存，避免通信失败时回报旧触点。`get_data` 只获取最新缓存，返回点数不超过 `capacity`。返回 -1 为参数/状态错误，-2 为 I²C 错误，-3 为点数超限。根据面板方向设置坐标互换和镜像，目前仅完成主机测试。
+## 错误与资源契约
+
+所有操作和传输/复位回调返回 `stm_err_t`，成功为 `STM_OK`，失败检查 `err != STM_OK`，不能使用 `err < 0`。HAL 适配将 `HAL_TIMEOUT` 映射为 `STM_ERR_TIMEOUT`，`HAL_ERROR/HAL_BUSY` 映射为 `STM_ERR_IO`；组件原样传递回调错误，延时回调仍返回 void。
+
+| 情况 | 错误 |
+| --- | --- |
+| 空参数、非法调用参数 | `STM_ERR_INVALID_ARG` |
+| 缺少必需回调、尺寸或方向配置错误 | `STM_ERR_INVALID_CONFIG` |
+| 输出句柄非空、面板未初始化 | `STM_ERR_INVALID_STATE` |
+| 控制对象/LVGL 对象分配失败 | `STM_ERR_NO_MEM` |
+| 绘图越界或像素长度计算溢出 | `STM_ERR_OUT_OF_RANGE` |
+| GT9271 ID 不匹配 | `STM_ERR_NOT_SUPPORTED` |
+| 触摸帧点数等数据校验失败 | `STM_ERR_VERIFY` |
+
+`create(config, &handle)` 要求 handle 初始为 NULL；复制配置，用 calloc/free 管理小型控制对象，芯片 create 不访问硬件。创建失败保持输出为空；非空输出被拒绝且原值不变。`delete(&handle)` 仅回收拥有的对象，成功清空 handle，空句柄也成功；NULL 句柄地址是参数错误。删除前停止并发访问，其他别名不会被自动清空。
+
+板级拥有 HAL、总线、GPIO、背光、外部缓冲和回调上下文；组件不释放或重新配置这些资源。实例使用期间上下文必须有效，可用 NULL io 表示无上下文。应用串行调用，组件不默认线程安全，不在中断中调用阻塞操作，不增加日志/RTT/RTOS 依赖。同步传输返回前必须用完输入缓冲；共享总线在整笔事务外加锁，DMA/DCache 一致性由板级管理。
+
+## 地址、坐标与失败状态
+
+板级保存 7 位 I²C 地址，HAL 参数用 `address_7bit << 1`。GT9271 常用 0x5d/0x14，INT/RST 地址选择由板级执行；FT5206 常用 0x38，按实物核实。寄存器地址宽度分别为 GT9271 16 位、FT5206 8 位。
+
+x_max/y_max 为变换后的逻辑尺寸，先 swap_xy、检查范围、再镜像；方向标志仅允许 0/1。越界点被过滤。get_data 返回实际复制的 min(点数,capacity)，capacity=0 允许空点数组；失败清零有效 count。复位清空缓存，通信/畸形帧失败清空本次状态，不自动重试；下一次 read_data 可恢复。
+
+## CMake 与依赖
+
+依赖 `stm_common` 的 `stm_err.h`，不复制公共错误码。优先复用已有 `stm_common` target，其次找同级源码；缺失时自动下载固定 v1.0.0 提交 `ce3d186dde2d374a8e9c7b9068a7b88f97d57dc1`。可设置 `STM_COMMON_FETCH=OFF` 禁止下载，`STM_COMMON_GIT_REPOSITORY=https://gitee.com/nzxhg/stm_common.git` 指定镜像，或 `FETCHCONTENT_SOURCE_DIR_STM_COMMON` 指定离线源码。已有 target/同级源码无需网络。
 
 ```cmake
 add_subdirectory(Lib/stm_lcd_touch_ft5206)
-target_link_libraries(app PRIVATE stm_lcd_touch_ft5206) # app 改为你的实际目标名
+target_link_libraries(your_firmware PRIVATE stm_lcd_touch_ft5206)
 ```
+
+手动集成时添加组件 include/源码及 stm_common 头文件目录。LVGL port 还要求应用提前提供 LVGL 9 的 `lvgl` target 和配置。
+
+## 从 v0.1.0 迁移
+
+| 旧接口 | 当前接口 |
+| --- | --- |
+| `stm_lcd_touch_ft5206_t` 公开结构体 | `lcd_touch_ft5206_handle_t`，初始 NULL |
+| `stm_lcd_touch_ft5206_config_t` | `lcd_touch_ft5206_config_t` |
+| `new_i2c(实例地址, config)` | `lcd_touch_ft5206_create(config, &handle)` |
+| 直接访问结构体 / 无销毁接口 | `lcd_touch_ft5206_delete(&handle)` |
+| int 与负数错误码 | `stm_err_t`，`err != STM_OK`，回调同步迁移 |
+
+其他操作使用 lcd_touch_<型号> 前缀，point_t 与 MAX_POINTS 常量也使用此组件前缀。
+
+FT5206 仅有主机验证，尚未实板验证。
+
+## 软件验证与发布状态
+
+```sh
+cmake -S tests -B build/tests -G Ninja -DCMAKE_BUILD_TYPE=Debug
+cmake --build build/tests
+ctest --test-dir build/tests --output-on-failure
+```
+
+主机测试覆盖参数/配置、分配失败、资源回收、多实例和错误传递，并编译 C11/C++17 公共头文件。测试分配器仅用于测试构建，不加入产品固件。中文 HAL 示例见 [examples/stm32_hal/README.md](examples/stm32_hal/README.md)。许可证见 [LICENSE](LICENSE)。
+
+当前为未发布的 API 软件迁移；已发布 `v0.1.0` 保留旧接口，迁移后的硬件回归待完成，尚未发布 v0.2.0。

@@ -1,29 +1,76 @@
 #include "stm_lcd_touch_ft5206.h"
+#include "test_allocator.h"
 #include <assert.h>
 #include <string.h>
-static int fail;
-static int rd(void *io, uint8_t reg, uint8_t *data, size_t n)
-{
-    (void)io;
-    if (fail) return -1;
-    if (reg==0x02) { assert(n==1); *data=2; return 0; }
-    assert(reg==0x03 && n==12);
-    memset(data,0,n);
-    data[1]=12; data[3]=20; data[2]=0x30; /* ID 3, y=20 */
-    data[6]=0xC0; /* reserved event is ignored */
-    return 0;
+typedef struct {
+    uint8_t status, raw[80]; unsigned reads, acks, resets;
+    stm_err_t read_error, point_error, ack_error, reset_error; int wrong_id;
+} mock_t;
+static stm_err_t read_reg(void *io, uint8_t reg,uint8_t *data,size_t len) {
+    mock_t *m=io; ++m->reads;
+    if (m->read_error) return m->read_error;
+
+    if (reg==0x02) { assert(len==1); *data=m->status; return STM_OK; }
+    assert(reg==0x03 && len<=sizeof m->raw);
+    if (m->point_error) return m->point_error;
+    memcpy(data,m->raw,len); return STM_OK;
 }
-int main(void)
-{
-    stm_lcd_touch_ft5206_t t={0};
-    stm_lcd_touch_ft5206_point_t pt[2]; size_t count=9;
-    stm_lcd_touch_ft5206_config_t cfg={rd,NULL,NULL,NULL,240,320,0,1,0};
-    assert(stm_lcd_touch_ft5206_new_i2c(&t,&cfg)==0);
-    assert(stm_lcd_touch_ft5206_read_data(&t)==0);
-    assert(stm_lcd_touch_ft5206_get_data(&t,pt,2,&count)==0);
-    assert(count==1 && pt[0].x==227 && pt[0].y==20 && pt[0].id==3);
-    fail=1;
-    assert(stm_lcd_touch_ft5206_read_data(&t)==-2);
-    assert(stm_lcd_touch_ft5206_get_data(&t,pt,2,&count)==0 && count==0);
+
+static void delay(void *io,uint32_t ms) { (void)io; assert(ms==20 || ms==50); }
+static stm_err_t reset(void *io,int high) { mock_t *m=io; ++m->resets; assert(high==0 || high==1); return m->reset_error; }
+static void set_points(mock_t *m) {
+    memset(m->raw,0,sizeof m->raw); m->status=0 | 2;
+    m->raw[1]=12; m->raw[2]=0x30; m->raw[3]=20; m->raw[7]=30; m->raw[8]=0x40; m->raw[9]=40;
+}
+int main(void) {
+    mock_t m={0},m2={0}; lcd_touch_ft5206_handle_t touch=NULL,other=NULL;
+    lcd_touch_ft5206_config_t cfg={.read_reg=read_reg,.delay_ms=delay,.reset=reset,.io=&m,.x_max=240,.y_max=320},bad;
+    lcd_touch_ft5206_point_t points[2]={{0}}; size_t count=999;
+    assert(lcd_touch_ft5206_create(NULL,&touch)==STM_ERR_INVALID_ARG);
+    assert(lcd_touch_ft5206_create(&cfg,NULL)==STM_ERR_INVALID_ARG);
+    assert(lcd_touch_ft5206_delete(NULL)==STM_ERR_INVALID_ARG);
+    assert(lcd_touch_ft5206_delete(&touch)==STM_OK);
+    bad=cfg; bad.read_reg=NULL; assert(lcd_touch_ft5206_create(&bad,&touch)==STM_ERR_INVALID_CONFIG);
+    bad=cfg; bad.x_max=0; assert(lcd_touch_ft5206_create(&bad,&touch)==STM_ERR_INVALID_CONFIG);
+    bad=cfg; bad.mirror_x=2; assert(lcd_touch_ft5206_create(&bad,&touch)==STM_ERR_INVALID_CONFIG);
+    bad=cfg; bad.delay_ms=NULL; assert(lcd_touch_ft5206_create(&bad,&touch)==STM_ERR_INVALID_CONFIG);
+    test_alloc_fail=1; assert(lcd_touch_ft5206_create(&cfg,&touch)==STM_ERR_NO_MEM && !touch && !test_alloc_live);
+    test_alloc_fail=0; assert(lcd_touch_ft5206_create(&cfg,&touch)==STM_OK && m.reads==0 && m.resets==0);
+    lcd_touch_ft5206_handle_t saved=touch;
+    assert(lcd_touch_ft5206_create(&cfg,&touch)==STM_ERR_INVALID_STATE && touch==saved);
+    cfg.io=&m2; assert(lcd_touch_ft5206_create(&cfg,&other)==STM_OK && test_alloc_live==2);
+    assert(lcd_touch_ft5206_get_data(NULL,points,2,&count)==STM_ERR_INVALID_ARG && count==0);
+    assert(lcd_touch_ft5206_get_data(touch,NULL,1,&count)==STM_ERR_INVALID_ARG && count==0);
+    assert(lcd_touch_ft5206_get_data(touch,NULL,0,&count)==STM_OK && count==0);
+    assert(lcd_touch_ft5206_get_data(touch,points,2,NULL)==STM_ERR_INVALID_ARG);
+
+    set_points(&m);
+    assert(lcd_touch_ft5206_read_data(touch)==STM_OK);
+    assert(lcd_touch_ft5206_get_data(touch,points,1,&count)==STM_OK && count==1 && points[0].x==12 && points[0].y==20);
+    assert(lcd_touch_ft5206_get_data(touch,points,2,&count)==STM_OK && count==2 && points[1].x==30);
+    assert(lcd_touch_ft5206_get_data(other,points,2,&count)==STM_OK && count==0);
+
+    m.status=0; assert(lcd_touch_ft5206_read_data(touch)==STM_OK);
+    assert(lcd_touch_ft5206_get_data(touch,points,2,&count)==STM_OK && count==0);
+    set_points(&m); assert(lcd_touch_ft5206_read_data(touch)==STM_OK);
+    m.read_error=STM_ERR_TIMEOUT; assert(lcd_touch_ft5206_read_data(touch)==STM_ERR_TIMEOUT);
+    assert(lcd_touch_ft5206_get_data(touch,points,2,&count)==STM_OK && count==0); m.read_error=STM_OK;
+    m.point_error=STM_ERR_CANCELLED; assert(lcd_touch_ft5206_read_data(touch)==STM_ERR_CANCELLED); m.point_error=STM_OK;
+    m.status=0 | 15; assert(lcd_touch_ft5206_read_data(touch)==STM_ERR_VERIFY);
+
+    m.reset_error=STM_ERR_IO; assert(lcd_touch_ft5206_reset(touch)==STM_ERR_IO);
+    assert(lcd_touch_ft5206_get_data(touch,points,2,&count)==STM_OK && count==0);
+    m.reset_error=STM_OK; assert(lcd_touch_ft5206_reset(touch)==STM_OK);
+    assert(lcd_touch_ft5206_delete(&touch)==STM_OK && !touch && test_alloc_live==1);
+    cfg.io=&m; cfg.swap_xy=1; cfg.mirror_x=1; cfg.mirror_y=1;
+    cfg.x_max=320; cfg.y_max=240;
+    assert(lcd_touch_ft5206_create(&cfg,&touch)==STM_OK);
+    set_points(&m); assert(lcd_touch_ft5206_read_data(touch)==STM_OK);
+    assert(lcd_touch_ft5206_get_data(touch,points,2,&count)==STM_OK && count==2 && points[0].x==299 && points[0].y==227);
+    m.raw[0]=0x40; /* 松开事件不作为有效触点。 */
+    assert(lcd_touch_ft5206_read_data(touch)==STM_OK);
+    assert(lcd_touch_ft5206_get_data(touch,points,2,&count)==STM_OK && count==1);
+    assert(lcd_touch_ft5206_delete(&touch)==STM_OK && lcd_touch_ft5206_delete(&other)==STM_OK && !test_alloc_live);
+    assert(lcd_touch_ft5206_delete(&touch)==STM_OK);
     return 0;
 }
